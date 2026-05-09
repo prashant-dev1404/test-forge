@@ -1,0 +1,127 @@
+name: test-forge harness
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  api-tests:
+    name: API Tests (Supertest)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout test-forge
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Checkout target repo (payout engine)
+        uses: actions/checkout@v4
+        with:
+          repository: prashant-dev1404/payout-engine   # update with real repo
+          path: target-repo
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python (for Django target)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install target repo dependencies
+        run: |
+          cd target-repo
+          pip install -r requirements.txt
+
+      - name: Run Django migrations
+        run: |
+          cd target-repo
+          python manage.py migrate
+        env:
+          DATABASE_URL: postgresql://testuser:testpass@localhost:5432/testdb
+          DJANGO_SETTINGS_MODULE: config.settings.test
+
+      - name: Start Django server
+        run: |
+          cd target-repo
+          python manage.py runserver 8000 &
+          sleep 3  # wait for server to be ready
+        env:
+          DATABASE_URL: postgresql://testuser:testpass@localhost:5432/testdb
+          DJANGO_SETTINGS_MODULE: config.settings.test
+
+      - name: Run forge (crawl + generate)
+        run: npm run forge -- --target ./target-repo --base-url http://localhost:8000
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Run generated API tests
+        run: npm run test:api
+        env:
+          BASE_URL: http://localhost:8000
+          TEST_DB_URL: postgresql://testuser:testpass@localhost:5432/testdb
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-test-report
+          path: reports/
+
+  e2e-tests:
+    name: E2E Tests (Playwright)
+    runs-on: ubuntu-latest
+    needs: api-tests   # only run E2E if API tests pass
+
+    steps:
+      - name: Checkout test-forge
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run generated E2E tests
+        run: npm run test:e2e
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL || 'http://localhost:8000' }}
+          TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+          TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
