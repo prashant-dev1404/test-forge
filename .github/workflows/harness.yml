@@ -58,23 +58,23 @@ jobs:
 
       - name: Run Django migrations
         run: |
-          cd target-repo
+          cd target-repo/backend
           python manage.py migrate
         env:
           DATABASE_URL: postgresql://testuser:testpass@localhost:5432/testdb
-          DJANGO_SETTINGS_MODULE: config.settings.test
+          DJANGO_SETTINGS_MODULE: playto.settings
 
       - name: Start Django server
         run: |
-          cd target-repo
+          cd target-repo/backend
           python manage.py runserver 8000 &
-          sleep 3  # wait for server to be ready
+          sleep 3
         env:
           DATABASE_URL: postgresql://testuser:testpass@localhost:5432/testdb
-          DJANGO_SETTINGS_MODULE: config.settings.test
+          DJANGO_SETTINGS_MODULE: playto.settings
 
       - name: Run forge (crawl + generate)
-        run: npm run forge -- --target ./target-repo --base-url http://localhost:8000
+        run: npm run forge -- --target ./target-repo/backend --base-url http://localhost:8000
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
