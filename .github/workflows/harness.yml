@@ -42,7 +42,7 @@ jobs:
       - name: Checkout target repo (payout engine)
         uses: actions/checkout@v4
         with:
-          repository: prashant-dev1404/payout-engine   # update with real repo
+          repository: prashant-dev1404/django-wallet
           path: target-repo
           token: ${{ secrets.GITHUB_TOKEN }}
 
