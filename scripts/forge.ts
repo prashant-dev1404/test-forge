@@ -2,6 +2,7 @@
 // CLI entrypoint. Usage:
 //   npx ts-node scripts/forge.ts --target /path/to/payout-engine --base-url http://localhost:8000
 
+import 'dotenv/config';
 import { Command } from 'commander';
 import ora from 'ora';
 import chalk from 'chalk';

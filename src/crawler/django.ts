@@ -52,8 +52,6 @@ export async function extractDjango(repoPath: string, baseUrl: string): Promise<
 }
 
 async function extractRoutes(repoPath: string): Promise<RouteDefinition[]> {
-  const routes: RouteDefinition[] = [];
-
   // Find all urls.py files
   const urlFiles = await glob('**/urls.py', {
     cwd: repoPath,
@@ -61,10 +59,25 @@ async function extractRoutes(repoPath: string): Promise<RouteDefinition[]> {
     absolute: true,
   });
 
+  const moduleToFile = new Map<string, string>();
+  const includedModules = new Set<string>();
+
   for (const urlFile of urlFiles) {
+    moduleToFile.set(toPythonModule(repoPath, urlFile), urlFile);
+
     const content = fs.readFileSync(urlFile, 'utf-8');
-    const extracted = parseUrlFile(content, urlFile, repoPath);
-    routes.push(...extracted);
+    for (const includeMatch of content.matchAll(/include\(\s*['"]([^'"]+)['"]\s*\)/g)) {
+      includedModules.add(includeMatch[1]);
+    }
+  }
+
+  const rootUrlFiles = urlFiles.filter(urlFile => !includedModules.has(toPythonModule(repoPath, urlFile)));
+  const entryFiles = rootUrlFiles.length > 0 ? rootUrlFiles : urlFiles;
+
+  const routes: RouteDefinition[] = [];
+  const visited = new Set<string>();
+  for (const urlFile of entryFiles) {
+    routes.push(...parseUrlFile(urlFile, repoPath, '', moduleToFile, visited));
   }
 
   // Enrich with docstrings from views
@@ -79,28 +92,48 @@ async function extractRoutes(repoPath: string): Promise<RouteDefinition[]> {
     enrichWithViewInfo(routes, content, viewFile);
   }
 
-  return routes;
+  return dedupeRoutes(routes);
 }
 
-function parseUrlFile(content: string, filePath: string, repoPath: string): RouteDefinition[] {
+function parseUrlFile(
+  filePath: string,
+  repoPath: string,
+  prefix: string,
+  moduleToFile: Map<string, string>,
+  visited: Set<string>
+): RouteDefinition[] {
+  const visitKey = `${filePath}::${prefix}`;
+  if (visited.has(visitKey)) return [];
+  visited.add(visitKey);
+
+  const content = fs.readFileSync(filePath, 'utf-8');
   const routes: RouteDefinition[] = [];
+  const lines = content.split(/\r?\n/);
 
-  // Match path() and re_path() declarations
-  // e.g. path('payouts/', PayoutViewSet.as_view({'post': 'create'}), name='payout-create')
-  const pathPattern = /path\(\s*['"]([^'"]+)['"]\s*,\s*([^,)]+)/g;
-  let match;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    const pathMatch = line.match(/^(?:path|re_path)\(\s*['"]([^'"]+)['"]\s*,\s*(.+)$/);
+    if (!pathMatch) continue;
 
-  while ((match = pathPattern.exec(content)) !== null) {
-    const urlPath = '/' + match[1].replace(/\/$/, '') + '/';
-    const viewRef = match[2].trim();
+    const urlPath = joinUrlPaths(prefix, pathFragmentToRoute(pathMatch[1]));
+    const target = pathMatch[2];
+
+    const includeMatch = target.match(/include\(\s*['"]([^'"]+)['"]\s*\)/);
+    if (includeMatch) {
+      const includedFile = moduleToFile.get(includeMatch[1]);
+      if (includedFile) {
+        routes.push(...parseUrlFile(includedFile, repoPath, urlPath, moduleToFile, visited));
+      }
+      continue;
+    }
 
     // Detect ViewSet with as_view method map
-    const asViewMatch = viewRef.match(/(\w+)\.as_view\(\{([^}]+)\}/);
+    const asViewMatch = target.match(/(\w+)\.as_view\(\{([^}]+)\}\)/);
     if (asViewMatch) {
       const actionMap = asViewMatch[2];
       // e.g. 'post': 'create', 'get': 'list'
       const actionPattern = /'(\w+)'\s*:\s*'(\w+)'/g;
-      let actionMatch;
+      let actionMatch: RegExpExecArray | null;
       while ((actionMatch = actionPattern.exec(actionMap)) !== null) {
         const httpMethod = actionMatch[1].toUpperCase() as HTTPMethod;
         const action = actionMatch[2];
@@ -117,7 +150,7 @@ function parseUrlFile(content: string, filePath: string, repoPath: string): Rout
     }
 
     // Detect APIView / generic view
-    const viewNameMatch = viewRef.match(/(\w+)\.as_view\(\)/);
+    const viewNameMatch = target.match(/(\w+)\.as_view\(\)/);
     if (viewNameMatch) {
       // We'll infer method from view name
       const viewName = viewNameMatch[1].toLowerCase();
@@ -130,14 +163,29 @@ function parseUrlFile(content: string, filePath: string, repoPath: string): Rout
         sourceFile: path.relative(repoPath, filePath),
         tags: inferTags(urlPath),
       });
+      continue;
+    }
+
+    // Detect function-based views such as path("healthz/", health_view)
+    const functionViewMatch = target.match(/^(\w+)\s*[,)]/);
+    if (functionViewMatch) {
+      routes.push({
+        method: 'GET',
+        path: urlPath,
+        name: functionViewMatch[1],
+        requiresAuth: !urlPath.includes('health'),
+        sourceFile: path.relative(repoPath, filePath),
+        tags: inferTags(urlPath),
+      });
     }
   }
 
   // Also detect DRF router registrations
   // e.g. router.register(r'payouts', PayoutViewSet, basename='payout')
   const routerPattern = /router\.register\(\s*r?['"]([^'"]+)['"]\s*,\s*(\w+)/g;
+  let match: RegExpExecArray | null;
   while ((match = routerPattern.exec(content)) !== null) {
-    const basePath = '/' + match[1] + '/';
+    const basePath = joinUrlPaths(prefix, pathFragmentToRoute(match[1]));
     // Router generates standard CRUD routes
     const crudRoutes: Array<{ method: HTTPMethod; suffix: string; action: string }> = [
       { method: 'GET', suffix: '', action: 'list' },
@@ -160,6 +208,44 @@ function parseUrlFile(content: string, filePath: string, repoPath: string): Rout
   }
 
   return routes;
+}
+
+function toPythonModule(repoPath: string, filePath: string): string {
+  return path
+    .relative(repoPath, filePath)
+    .replace(/\\/g, '/')
+    .replace(/\.py$/, '')
+    .replace(/\//g, '.');
+}
+
+function pathFragmentToRoute(fragment: string): string {
+  const hasTrailingSlash = /\/$/.test(fragment);
+  const normalized = fragment
+    .replace(/<[^:>]+:([^>]+)>/g, '{$1}')
+    .replace(/<([^>]+)>/g, '{$1}')
+    .replace(/^\/+|\/+$/g, '');
+
+  if (!normalized) return '/';
+  return hasTrailingSlash ? `/${normalized}/` : `/${normalized}`;
+}
+
+function joinUrlPaths(prefix: string, route: string): string {
+  if (prefix === '/' || !prefix) return route;
+  if (route === '/') return prefix;
+
+  const prefixPart = prefix.replace(/\/$/, '');
+  const routePart = route.replace(/^\//, '');
+  return `${prefixPart}/${routePart}`.replace(/\/+/g, '/');
+}
+
+function dedupeRoutes(routes: RouteDefinition[]): RouteDefinition[] {
+  const seen = new Set<string>();
+  return routes.filter(route => {
+    const key = `${route.method} ${route.path}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function enrichWithViewInfo(routes: RouteDefinition[], viewContent: string, filePath: string): void {
